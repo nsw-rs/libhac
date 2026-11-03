@@ -14,6 +14,7 @@ repository = "https://github.com/nsw-rs/libhac"
 readme = "README.md"
 keywords = ["nintendo-switch", "nca", "nsp", "romfs", "pfs0"]
 categories = ["parser-implementations", "filesystem"]
+exclude = ["/.github", "/.gitignore", "/deny.toml"]
 
 [dependencies]
 aes = "0.9.3"
