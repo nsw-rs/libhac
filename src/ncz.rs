@@ -2,16 +2,21 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Block compressed NCZ: an NCA with its sections decrypted and zstd
-//! compressed in independent blocks, as written by nsz. [`NczReader`]
-//! serves the original NCA, decompressed and re-encrypted on the fly.
+//! NCZ: an NCA with its sections decrypted and zstd compressed, as written
+//! by nsz. [`NczReader`] serves the original NCA, decompressed and
+//! re-encrypted on the fly.
 //!
 //! Layout: the first 0x4000 bytes of the NCA as they are, then `NCZSECTN`
 //! with the section table (offset, size, crypto type, key, counter), then
-//! `NCZBLOCK` with the block size and the compressed length of each block,
-//! then the blocks. A block whose length is not smaller than its
-//! decompressed size is stored raw. Solid NCZ (one zstd stream, no block
-//! table) has no random access and is not supported.
+//! the rest of the NCA from 0x4000 on, compressed one of two ways:
+//!
+//! - block: `NCZBLOCK` with the block size and the compressed length of each
+//!   block, then the blocks, compressed independently. A block whose length
+//!   is not smaller than its decompressed size is stored raw. Reads are
+//!   random access.
+//! - solid: one zstd stream. It has no random access: reads that move
+//!   forward continue the stream, a read before the current position
+//!   decodes it again from the start. Read it sequentially.
 
 use crate::bytes::{array_at, u32_le, u64_le};
 use crate::crypto::CtrKey;
@@ -44,19 +49,129 @@ struct Section {
 /// An NCZ read as the NCA it was made from.
 pub struct NczReader<S> {
     src: S,
-    /// Cache key of this reader.
-    id: u64,
     size: u64,
     sections: Vec<Section>,
+    body: Body,
+}
+
+/// How the NCA past the raw header is compressed.
+enum Body {
+    Block(Blocks),
+    Solid(Mutex<Solid>),
+}
+
+/// Block table of a block NCZ.
+struct Blocks {
+    /// Cache key of this reader.
+    id: u64,
     block_size: u64,
     decompressed_size: u64,
     /// Offset in `src` and compressed length of each block.
     blocks: Vec<(u64, u32)>,
 }
 
+/// Compressed bytes read from `src` per refill of a solid stream.
+const SOLID_INPUT: usize = 0x20000;
+
+fn zstd_err(e: std::io::Error) -> Error {
+    Error::InvalidData(format!("NCZ zstd: {e}"))
+}
+
+/// Decoding state of a solid stream.
+struct Solid {
+    dec: zstd::stream::raw::Decoder<'static>,
+    /// Offsets in `src` of the stream start and end.
+    start: u64,
+    end: u64,
+    /// Offset in `src` of the next compressed bytes to read.
+    next_in: u64,
+    /// Compressed bytes read but not consumed yet: `input[used..filled]`.
+    input: Box<[u8]>,
+    used: usize,
+    filled: usize,
+    /// Decompressed bytes produced so far.
+    pos: u64,
+}
+
+impl Solid {
+    fn new(start: u64, end: u64) -> Result<Self> {
+        Ok(Solid {
+            dec: zstd::stream::raw::Decoder::new().map_err(zstd_err)?,
+            start,
+            end,
+            next_in: start,
+            input: vec![0; SOLID_INPUT].into_boxed_slice(),
+            used: 0,
+            filled: 0,
+            pos: 0,
+        })
+    }
+
+    /// Go back to the start of the stream.
+    fn rewind(&mut self) -> Result<()> {
+        use zstd::stream::raw::Operation;
+        self.next_in = self.start;
+        self.used = 0;
+        self.filled = 0;
+        self.pos = 0;
+        self.dec.reinit().map_err(zstd_err)
+    }
+
+    /// Fill `out` with the stream from decompressed offset `pos`. A `pos`
+    /// behind the current position decodes again from the start; bytes
+    /// skipped to reach `pos` are decoded into `out` and overwritten.
+    fn read_at(&mut self, src: &impl ReadAt, pos: u64, out: &mut [u8]) -> Result<()> {
+        let mut res = Ok(());
+        if pos < self.pos {
+            res = self.rewind();
+        }
+        while res.is_ok() && self.pos < pos && !out.is_empty() {
+            let n = (pos - self.pos).min(out.len() as u64) as usize;
+            res = self.fill(src, &mut out[..n]);
+        }
+        if res.is_ok() {
+            res = self.fill(src, out);
+        }
+        if let Err(e) = res {
+            // The decoder state is unusable after an error.
+            self.rewind()?;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Fill `out` with the next decompressed bytes of the stream.
+    fn fill(&mut self, src: &impl ReadAt, out: &mut [u8]) -> Result<()> {
+        use zstd::stream::raw::{InBuffer, Operation, OutBuffer};
+        let mut done = 0;
+        while done < out.len() {
+            if self.used == self.filled {
+                let n = (self.end - self.next_in).min(SOLID_INPUT as u64) as usize;
+                if n == 0 {
+                    fail!(InvalidData, "NCZ zstd stream ends early");
+                }
+                src.read_at(self.next_in, &mut self.input[..n])?;
+                self.next_in += n as u64;
+                self.used = 0;
+                self.filled = n;
+            }
+            let mut inb = InBuffer::around(&self.input[self.used..self.filled]);
+            let mut outb = OutBuffer::around(&mut out[done..]);
+            self.dec.run(&mut inb, &mut outb).map_err(zstd_err)?;
+            let (consumed, produced) = (inb.pos(), outb.pos());
+            if consumed == 0 && produced == 0 {
+                fail!(InvalidData, "NCZ zstd stream stalled");
+            }
+            self.used += consumed;
+            done += produced;
+            self.pos += produced as u64;
+        }
+        Ok(())
+    }
+}
+
 impl<S: ReadAt> NczReader<S> {
-    /// Open the NCZ that makes up all of `src`. Fails with
-    /// [`Error::Unsupported`] for a solid NCZ.
+    /// Open the NCZ that makes up all of `src`.
     pub fn open(src: S) -> Result<Self> {
         let src_size = src.size()?;
         let read =
@@ -106,10 +221,18 @@ impl<S: ReadAt> NczReader<S> {
             size = size.max(end);
         }
 
-        let bh = read(pos, 24)?;
-        if &bh[..8] != b"NCZBLOCK" {
-            fail!(Unsupported, "solid NCZ (not block compressed)");
+        // A solid stream starts with the zstd frame magic, so it is never
+        // mistaken for NCZBLOCK.
+        if src_size.saturating_sub(pos) < 8 || read(pos, 8)? != b"NCZBLOCK" {
+            let solid = Solid::new(pos, src_size)?;
+            return Ok(NczReader {
+                src,
+                size,
+                sections,
+                body: Body::Solid(Mutex::new(solid)),
+            });
         }
+        let bh = read(pos, 24)?;
         let exp = bh[11];
         // nsz allows blocks of up to 2^32 bytes (default 2^20), so decoding
         // one valid block of a legal file can need that much memory.
@@ -146,13 +269,20 @@ impl<S: ReadAt> NczReader<S> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Ok(NczReader {
             src,
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             size,
             sections,
-            block_size,
-            decompressed_size,
-            blocks,
+            body: Body::Block(Blocks {
+                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                block_size,
+                decompressed_size,
+                blocks,
+            }),
         })
+    }
+
+    /// True for a solid NCZ, which only reads fast sequentially.
+    pub fn is_solid(&self) -> bool {
+        matches!(self.body, Body::Solid(_))
     }
 
     /// Apply AES-CTR to the parts of `buf` (at NCA offset `off`) that fall
@@ -170,9 +300,35 @@ impl<S: ReadAt> NczReader<S> {
             }
         }
     }
+}
+
+impl Blocks {
+    /// Fill `out` with the decompressed stream from offset `pos`, zeros
+    /// past its end.
+    fn read(&self, src: &impl ReadAt, pos: u64, out: &mut [u8]) -> Result<()> {
+        let mut done = 0;
+        while done < out.len() {
+            let pos = pos + done as u64;
+            let id = pos / self.block_size;
+            let inner = (pos % self.block_size) as usize;
+            let data = match usize::try_from(id) {
+                Ok(id) if id < self.blocks.len() => self.block(src, id)?,
+                _ => Block::default(),
+            };
+            if inner >= data.len() {
+                // Past the decompressed stream: nothing left to copy.
+                out[done..].fill(0);
+                break;
+            }
+            let n = (out.len() - done).min(data.len() - inner);
+            out[done..done + n].copy_from_slice(&data[inner..inner + n]);
+            done += n;
+        }
+        Ok(())
+    }
 
     /// Block `id` decompressed, from the cache when possible.
-    fn block(&self, id: usize) -> Result<Block> {
+    fn block(&self, src: &impl ReadAt, id: usize) -> Result<Block> {
         let key = (self.id, id);
         let cell = {
             let mut c = cache();
@@ -188,13 +344,13 @@ impl<S: ReadAt> NczReader<S> {
                     return Ok(Arc::clone(data));
                 }
                 // The decode failed: try again to get the error.
-                return self.decode(id).map(Arc::new);
+                return self.decode(src, id).map(Arc::new);
             }
             let p = Arc::new(OnceLock::new());
             c.pending.push((key, Arc::clone(&p)));
             PendingGuard { key, cell: p }
         };
-        let res = self.decode(id).map(Arc::new);
+        let res = self.decode(src, id).map(Arc::new);
         let mut c = cache();
         c.pending.retain(|(k, _)| *k != key);
         if let Ok(data) = &res {
@@ -206,7 +362,7 @@ impl<S: ReadAt> NczReader<S> {
     }
 
     /// Read and decompress block `id`.
-    fn decode(&self, id: usize) -> Result<Vec<u8>> {
+    fn decode(&self, src: &impl ReadAt, id: usize) -> Result<Vec<u8>> {
         let mut size = self.block_size;
         if id == self.blocks.len() - 1 {
             let rem = self.decompressed_size % self.block_size;
@@ -234,11 +390,11 @@ impl<S: ReadAt> NczReader<S> {
         };
         if (clen as u64) >= size {
             let mut data = alloc(size)?;
-            self.src.read_at(pos, &mut data)?;
+            src.read_at(pos, &mut data)?;
             return Ok(data);
         }
         let mut comp = alloc(clen as u64)?;
-        self.src.read_at(pos, &mut comp)?;
+        src.read_at(pos, &mut comp)?;
         let mut data = reserve(size)?;
         let n = zstd::bulk::Decompressor::new()
             .and_then(|mut d| d.decompress_to_buffer(&comp, &mut data))
@@ -259,23 +415,17 @@ impl<S: ReadAt> ReadAt for NczReader<S> {
             self.src.read_at(off, &mut buf[..n])?;
             done = n;
         }
-        // Decompressed stream position = NCA offset - 0x4000.
-        while done < buf.len() {
+        if done < buf.len() {
+            // Decompressed stream position = NCA offset - 0x4000.
             let pos = off + done as u64 - NCA_HEADER_SIZE;
-            let id = pos / self.block_size;
-            let inner = (pos % self.block_size) as usize;
-            let data = match usize::try_from(id) {
-                Ok(id) if id < self.blocks.len() => self.block(id)?,
-                _ => Block::default(),
-            };
-            if inner >= data.len() {
-                // Past the decompressed stream: nothing left to copy.
-                buf[done..].fill(0);
-                break;
+            let out = &mut buf[done..];
+            match &self.body {
+                Body::Block(b) => b.read(&self.src, pos, out)?,
+                Body::Solid(s) => {
+                    let mut s = s.lock().unwrap_or_else(|e| e.into_inner());
+                    s.read_at(&self.src, pos, out)?;
+                }
             }
-            let n = (buf.len() - done).min(data.len() - inner);
-            buf[done..done + n].copy_from_slice(&data[inner..inner + n]);
-            done += n;
         }
         self.crypt(buf, off);
         Ok(())
@@ -434,6 +584,15 @@ pub(crate) mod tests {
     /// section), an encrypted section not aligned to blocks and a partial
     /// last block.
     pub fn test_ncz(seed: u64) -> (Vec<u8>, Vec<u8>) {
+        layout_ncz(seed, false)
+    }
+
+    /// [`test_ncz`] layout, solid compressed.
+    pub fn solid_test_ncz() -> (Vec<u8>, Vec<u8>) {
+        layout_ncz(11, true)
+    }
+
+    fn layout_ncz(seed: u64, solid: bool) -> (Vec<u8>, Vec<u8>) {
         let mut rng = Rng(seed * 0x9e37_79b9 + 1);
         let size = NCA_HEADER_SIZE as usize + 6 * 0x4000 + 1234;
         let plain = plain_nca(&mut rng, size);
@@ -449,18 +608,7 @@ pub(crate) mod tests {
                 key: None,
             },
         ];
-        build_ncz(&plain, &secs, 14, false)
-    }
-
-    pub fn solid_ncz() -> Vec<u8> {
-        let mut rng = Rng(3);
-        let plain = plain_nca(&mut rng, NCA_HEADER_SIZE as usize + 0x8000);
-        let secs = [TestSection {
-            offset: NCA_HEADER_SIZE as usize,
-            size: 0x8000,
-            key: None,
-        }];
-        build_ncz(&plain, &secs, 0, true).0
+        build_ncz(&plain, &secs, 14, solid)
     }
 
     /// Check random reads of `r` against `want`. Small reads hit unaligned
@@ -482,24 +630,33 @@ pub(crate) mod tests {
         assert!(r.read_at(want.len() as u64 - 1, &mut p).is_err());
     }
 
+    fn blocks<S>(r: &NczReader<S>) -> &Blocks {
+        match &r.body {
+            Body::Block(b) => b,
+            Body::Solid(_) => panic!("solid NCZ"),
+        }
+    }
+
     #[test]
     fn read_at() {
         let (ncz, want) = test_ncz(1);
         let r = NczReader::open(&ncz).unwrap();
+        assert!(!r.is_solid());
         assert_eq!(r.size().unwrap(), want.len() as u64);
-        let raw = r
+        let b = blocks(&r);
+        let raw = b
             .blocks
             .iter()
             .enumerate()
             .filter(|&(i, &(_, l))| {
-                l as u64 >= r.block_size
-                    || i == r.blocks.len() - 1 && l as u64 >= r.decompressed_size % r.block_size
+                l as u64 >= b.block_size
+                    || i == b.blocks.len() - 1 && l as u64 >= b.decompressed_size % b.block_size
             })
             .count();
         assert!(
-            raw > 0 && raw < r.blocks.len(),
+            raw > 0 && raw < b.blocks.len(),
             "{raw}/{} raw blocks",
-            r.blocks.len()
+            b.blocks.len()
         );
         let mut got = vec![0u8; want.len()];
         r.read_at(0, &mut got).unwrap();
@@ -527,11 +684,35 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn solid_is_unsupported() {
-        assert!(matches!(
-            NczReader::open(&solid_ncz()),
-            Err(Error::Unsupported(_))
-        ));
+    fn solid_read_at() {
+        let (ncz, want) = solid_test_ncz();
+        let r = NczReader::open(&ncz).unwrap();
+        assert!(r.is_solid());
+        assert_eq!(r.size().unwrap(), want.len() as u64);
+        let mut got = vec![0u8; want.len()];
+        r.read_at(0, &mut got).unwrap();
+        assert!(got == want, "full read mismatch");
+        // Sequential reads in small pieces continue the stream.
+        let mut seq = Vec::new();
+        for c in want.chunks(0x1234) {
+            let mut p = vec![0u8; c.len()];
+            r.read_at(seq.len() as u64, &mut p).unwrap();
+            seq.extend_from_slice(&p);
+        }
+        assert!(seq == want, "sequential read mismatch");
+        check_random_reads(&r, &want);
+    }
+
+    /// A solid stream that ends early is an error every time it is read.
+    #[test]
+    fn truncated_solid() {
+        let (ncz, want) = solid_test_ncz();
+        let r = NczReader::open(&ncz[..ncz.len() - 100]).unwrap();
+        let mut got = vec![0u8; want.len()];
+        for _ in 0..2 {
+            let res = r.read_at(0, &mut got);
+            assert!(matches!(res, Err(Error::InvalidData(_))), "{res:?}");
+        }
     }
 
     /// A zstd block that ends early is an error, not a short read.
@@ -539,8 +720,8 @@ pub(crate) mod tests {
     fn truncated_block() {
         let (mut ncz, _) = test_ncz(1);
         let r = NczReader::open(&ncz).unwrap();
-        let (_, len) = r.blocks[0];
-        assert!((len as u64) < r.block_size, "block 0 stored raw");
+        let (_, len) = blocks(&r).blocks[0];
+        assert!((len as u64) < blocks(&r).block_size, "block 0 stored raw");
         let i = ncz.windows(8).position(|w| w == b"NCZBLOCK").unwrap() + 24;
         ncz[i..i + 4].copy_from_slice(&(len - 1).to_le_bytes());
         let r = NczReader::open(&ncz).unwrap();

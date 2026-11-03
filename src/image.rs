@@ -108,6 +108,9 @@ fn open_entry(src: &Shared, e: &Entry, ncz: bool) -> Result<Shared> {
         return Ok(Arc::new(sub));
     }
     match NczReader::open(sub) {
+        // Image reads jump around (FUSE readahead, concurrent readers), which
+        // would decode a solid stream again from the start each time.
+        Ok(r) if r.is_solid() => fail!(Unsupported, "{}: solid NCZ (not block compressed)", e.name),
         Ok(r) => Ok(Arc::new(r)),
         Err(err) => Err(err.prefixed(&e.name)),
     }
@@ -252,7 +255,7 @@ pub fn build_xci(src: Shared) -> Result<Image> {
 mod tests {
     use super::*;
     use crate::Error;
-    use crate::ncz::tests::{check_random_reads, solid_ncz, test_ncz};
+    use crate::ncz::tests::{check_random_reads, solid_test_ncz, test_ncz};
     use crate::partition::tests::build_fs;
     use crate::xci::tests::build_xci as build_test_xci;
 
@@ -362,7 +365,7 @@ mod tests {
 
     #[test]
     fn solid_container() {
-        let nsz = fs(PartitionKind::Pfs0, &[("eeee.ncz", solid_ncz())], 1);
+        let nsz = fs(PartitionKind::Pfs0, &[("eeee.ncz", solid_test_ncz().0)], 1);
         assert!(matches!(
             build_nsp(Arc::new(nsz)),
             Err(Error::Unsupported(_))
