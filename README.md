@@ -82,7 +82,7 @@ fn main() -> libhac::Result<()> {
 | Patch (BKTR indirect/AES-CTR-EX) and sparse sections | not ported |
 | Writable storage, `IFileSystem`/`IFile` abstractions | not ported |
 | XCI | partial: card header, root and partition HFS0 |
-| NCZ/XCZ (nsz) | block compressed NCZ, NSZ/XCZ images (feature `ncz`); solid NCZ not supported |
+| NCZ/XCZ (nsz) | NCZ reading (block and solid), block NCZ writing, NSZ/XCZ images of block NCZs (feature `ncz`) |
 | NSO/NRO, save data | not ported |
 | `hactoolnet`-like command line tool | not ported |
 

@@ -304,7 +304,7 @@ impl<S: ReadAt> ReadAt for VerifiedStorage<'_, S> {
 
 // ---------------------------------------------------------------- compression
 
-/// Bucket tree node size used by `CompressedStorage`.
+/// Bucket tree node size.
 const BKTR_NODE_SIZE: usize = 0x4000;
 /// Size of a bucket tree node header: index (s32), count (s32), end offset (s64).
 const BKTR_NODE_HEADER: usize = 0x10;
@@ -323,6 +323,86 @@ struct CompressedEntry {
     phys_size: u32,
 }
 
+/// Read the entries of a LibHac `BucketTree` stored in `base`, passing the
+/// `entry_size` bytes of each to `f`. `info` is the FS header table info:
+/// table offset and size, then the bucket tree header. Returns the end
+/// offset of the tree. `what` names the table in errors.
+///
+/// Every entry starts with its offset (u64). A non-empty tree needs a first
+/// entry at offset 0, then strictly rising offsets below the end.
+fn bucket_tree(
+    base: &impl ReadAt,
+    info: &[u8],
+    entry_size: usize,
+    what: &str,
+    f: &mut dyn FnMut(&[u8]),
+) -> Result<u64> {
+    let table_offset = u64_le(info, 0);
+    let table_size = u64_le(info, 8);
+    if &info[0x10..0x14] != b"BKTR" {
+        fail!(InvalidMagic, "Invalid {what} table header");
+    }
+    let count = u32_le(info, 0x18) as usize;
+
+    // Layout from `BucketTree.QueryNodeStorageSize`/`QueryEntryStorageSize`:
+    // the L1 node, optional L2 nodes, then the entry sets.
+    let per_set = (BKTR_NODE_SIZE - BKTR_NODE_HEADER) / entry_size;
+    let offsets_per_node = (BKTR_NODE_SIZE - BKTR_NODE_HEADER) / 8;
+    let sets = count.div_ceil(per_set);
+    let l2_nodes = if sets <= offsets_per_node {
+        0
+    } else {
+        let n = sets.div_ceil(offsets_per_node);
+        // LibHac aborts here; past this point the subtraction underflows.
+        if n > offsets_per_node {
+            fail!(InvalidData, "Invalid {what} table");
+        }
+        (sets - (offsets_per_node - (n - 1))).div_ceil(offsets_per_node)
+    };
+    let node_size = BKTR_NODE_SIZE as u64;
+    let node_storage = node_size * (l2_nodes as u64 + 1);
+    // The table must lie inside the data level before `count` entries
+    // are allocated, since `count` comes from the file.
+    let base_size = base.size()?;
+    if node_storage + sets as u64 * node_size > table_size
+        || !in_range(table_offset, table_size, base_size)
+    {
+        // `what` is an ASCII literal.
+        let (first, rest) = what.split_at(1);
+        fail!(
+            OutOfRange,
+            "{}{rest} table out of range",
+            first.to_uppercase()
+        );
+    }
+
+    let l1 = base.read_vec(table_offset, BKTR_NODE_SIZE)?;
+    let size = u64_le(&l1, 8);
+    let mut seen = 0;
+    let mut prev = None;
+    for set in 0..sets {
+        let node = base.read_vec(
+            table_offset + node_storage + set as u64 * node_size,
+            BKTR_NODE_SIZE,
+        )?;
+        let n = (u32_le(&node, 4) as usize).min(per_set);
+        for k in 0..n {
+            let e = &node[BKTR_NODE_HEADER + k * entry_size..][..entry_size];
+            let off = u64_le(e, 0);
+            if prev.map_or(off != 0, |p| off <= p) {
+                fail!(InvalidData, "Invalid {what} table");
+            }
+            prev = Some(off);
+            f(e);
+        }
+        seen += n;
+    }
+    if seen != count || prev.map_or(size != 0, |p| p >= size) {
+        fail!(InvalidData, "Invalid {what} table");
+    }
+    Ok(size)
+}
+
 /// LibHac `CompressedStorage`: the decompressed view of a verified data
 /// level, described by a bucket tree stored inside that level.
 struct CompressedStorage<'a, S> {
@@ -338,66 +418,21 @@ impl<'a, S: ReadAt> CompressedStorage<'a, S> {
     /// `info` is the FS header `CompressionInfo`: table offset and size,
     /// then the bucket tree header.
     fn open(base: VerifiedStorage<'a, S>, info: &[u8]) -> Result<Self> {
-        let table_offset = u64_le(info, 0);
-        let table_size = u64_le(info, 8);
-        if &info[0x10..0x14] != b"BKTR" {
-            fail!(InvalidMagic, "Invalid compression table header");
-        }
-        let count = u32_le(info, 0x18) as usize;
-
-        // Layout from `BucketTree.QueryNodeStorageSize`/`QueryEntryStorageSize`:
-        // the L1 node, optional L2 nodes, then the entry sets.
-        let per_set = (BKTR_NODE_SIZE - BKTR_NODE_HEADER) / COMPRESSED_ENTRY_SIZE;
-        let offsets_per_node = (BKTR_NODE_SIZE - BKTR_NODE_HEADER) / 8;
-        let sets = count.div_ceil(per_set);
-        let l2_nodes = if sets <= offsets_per_node {
-            0
-        } else {
-            let n = sets.div_ceil(offsets_per_node);
-            // LibHac aborts here; past this point the subtraction underflows.
-            if n > offsets_per_node {
-                fail!(InvalidData, "Invalid compression table");
-            }
-            (sets - (offsets_per_node - (n - 1))).div_ceil(offsets_per_node)
-        };
-        let node_size = BKTR_NODE_SIZE as u64;
-        let node_storage = node_size * (l2_nodes as u64 + 1);
-        // The table must lie inside the data level before `count` entries
-        // are allocated, since `count` comes from the file.
-        let base_size = base.size()?;
-        if node_storage + sets as u64 * node_size > table_size
-            || !in_range(table_offset, table_size, base_size)
-        {
-            fail!(OutOfRange, "Compression table out of range");
-        }
-
-        let l1 = base.read_vec(table_offset, BKTR_NODE_SIZE)?;
-        let size = u64_le(&l1, 8);
-        let mut entries = Vec::with_capacity(count);
-        for set in 0..sets {
-            let node = base.read_vec(
-                table_offset + node_storage + set as u64 * node_size,
-                BKTR_NODE_SIZE,
-            )?;
-            let n = (u32_le(&node, 4) as usize).min(per_set);
-            for k in 0..n {
-                let e = &node[BKTR_NODE_HEADER + k * COMPRESSED_ENTRY_SIZE..];
+        let mut entries = Vec::new();
+        let size = bucket_tree(
+            &base,
+            info,
+            COMPRESSED_ENTRY_SIZE,
+            "compression",
+            &mut |e| {
                 entries.push(CompressedEntry {
                     virt: u64_le(e, 0),
                     phys: u64_le(e, 8),
                     kind: e[0x10],
                     phys_size: u32_le(e, 0x14),
-                });
-            }
-        }
-        // A non-empty storage needs a first entry at offset 0.
-        if entries.len() != count
-            || entries.first().map_or(size != 0, |e| e.virt != 0)
-            || !entries.windows(2).all(|w| w[0].virt < w[1].virt)
-            || entries.last().is_some_and(|e| e.virt >= size)
-        {
-            fail!(InvalidData, "Invalid compression table");
-        }
+                })
+            },
+        )?;
         Ok(CompressedStorage {
             base,
             entries,
@@ -512,7 +547,13 @@ impl FsHeader<'_> {
         let info = &self.raw[0x178..0x1A0];
         (u64_le(info, 0) != 0 && u64_le(info, 8) != 0).then_some(info)
     }
-    fn upper_counter(&self) -> [u8; 8] {
+    /// LibHac `NcaFsHeader.AesCtrExInfo` (patch sections): table offset
+    /// and size, then the bucket tree header.
+    #[cfg(feature = "ncz")]
+    fn aes_ctr_ex_info(&self) -> &[u8] {
+        &self.raw[0x120..0x140]
+    }
+    pub(crate) fn upper_counter(&self) -> [u8; 8] {
         u64_le(self.raw, 0x140).to_be_bytes()
     }
 }
@@ -559,6 +600,21 @@ impl TitleKeys {
 impl fmt::Debug for TitleKeys {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+#[cfg(all(test, feature = "ncz"))]
+impl<S> Nca<S> {
+    /// An NCA over `storage` with the already decrypted 0xC00 byte
+    /// `header` and the decrypted key area AES-CTR key `key`.
+    pub(crate) fn with_plain_header(storage: S, header: Vec<u8>, key: [u8; 16]) -> Self {
+        Nca {
+            storage,
+            rights_id: RightsId(array_at(&header, 0x230).unwrap()),
+            header,
+            key_area_ctr: Some(key),
+            titlekek: None,
+        }
     }
 }
 
@@ -657,7 +713,8 @@ impl<S: ReadAt> Nca<S> {
         )
     }
 
-    fn section_bounds(&self, i: SectionIndex) -> (u64, u64) {
+    /// Start and end offsets of section `i` in the NCA.
+    pub(crate) fn section_bounds(&self, i: SectionIndex) -> (u64, u64) {
         let o = 0x240 + i.get() * 0x10;
         (
             u32_le(&self.header, o) as u64 * 0x200,
@@ -712,13 +769,61 @@ impl<S: ReadAt> Nca<S> {
         }
     }
 
-    fn section_key(&self, title_keys: &TitleKeys) -> Result<[u8; 16]> {
+    /// AES-CTR key of the sections: the decrypted title key or key area key.
+    pub(crate) fn section_key(&self, title_keys: &TitleKeys) -> Result<[u8; 16]> {
         if !self.rights_id.is_zero() {
             self.decrypted_title_key(title_keys)
         } else {
             self.key_area_ctr
                 .ok_or_else(|| Error::MissingKey("Missing key area key".into()))
         }
+    }
+
+    /// Counter ranges of AesCtrEx section `i` (patch sections) with section
+    /// key `key`: offset in the NCA, size and upper counter of each part.
+    /// Each bucket tree entry has its own counter generation up to the end
+    /// of the tree; the tables after it use the FS header counter.
+    #[cfg(feature = "ncz")]
+    pub(crate) fn aes_ctr_ex_ranges(
+        &self,
+        i: SectionIndex,
+        key: &[u8; 16],
+    ) -> Result<Vec<(u64, u64, [u8; 8])>> {
+        const ENTRY_SIZE: usize = 0x10;
+        let (start, end) = self.section_bounds(i);
+        let fsh = self.fs_header(i);
+        let upper = fsh.upper_counter();
+        let base = SectionStorage {
+            nca: &self.storage,
+            start,
+            size: end - start,
+            ctr: Some(CtrKey::new(key, upper)),
+        };
+        // Entry: offset (u64), reserved (u32), generation (u32).
+        let mut subs = Vec::new();
+        let tree_end = bucket_tree(
+            &base,
+            fsh.aes_ctr_ex_info(),
+            ENTRY_SIZE,
+            "AesCtrEx",
+            &mut |e| subs.push((u64_le(e, 0), u32_le(e, 0xC))),
+        )?;
+        if tree_end > end - start {
+            fail!(InvalidData, "Invalid AesCtrEx table");
+        }
+        let mut ranges = Vec::with_capacity(subs.len() + 1);
+        let mut done = 0;
+        for (j, &(off, generation)) in subs.iter().enumerate() {
+            let next = subs.get(j + 1).map_or(tree_end, |s| s.0);
+            let mut u = upper;
+            u[4..].copy_from_slice(&generation.to_be_bytes());
+            ranges.push((start + off, next - off, u));
+            done = next;
+        }
+        if done < end - start {
+            ranges.push((start + done, end - start - done, upper));
+        }
+        Ok(ranges)
     }
 
     /// Open the hash-verified data level of section `i`, decompressed when

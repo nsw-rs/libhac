@@ -19,6 +19,9 @@ ignore = [
     # offline, so an attacker has no timing oracle. No fixed rsa release
     # exists yet.
     { id = "RUSTSEC-2023-0071", reason = "no remote timing oracle for offline title key decryption" },
+    # zstd-sys before 2.0.10 on wasm32 only. The NCZ writer needs this exact
+    # libzstd for its output to stay the same, and wasm32 is not a target.
+    { id = "RUSTSEC-2026-0410", reason = "wasm32 only; pin needed for reproducible NCZ output" },
 ]
 
 # ---------------------------------------------------------------------------

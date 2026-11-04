@@ -31,6 +31,8 @@ mod testutil;
 pub mod ticket;
 mod types;
 pub mod xci;
+#[cfg(feature = "ncz")]
+mod zstd;
 
 pub use error::{Error, Result};
 pub use keys::Keys;

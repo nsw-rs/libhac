@@ -20,6 +20,7 @@ use crate::error::{Error, Result, fail};
 use crate::partition::{Entry, PartitionFs};
 use crate::storage::{ReadAt, check_range, read_array};
 use crate::xci::XciRoot;
+use crate::zstd::ReadDecoder;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -73,7 +74,7 @@ impl Read for RangeReader {
     }
 }
 
-type Decoder = zstd::stream::read::Decoder<'static, io::BufReader<RangeReader>>;
+type Decoder = ReadDecoder<RangeReader>;
 
 /// A zstd stream decoder over `src[pos..pos + len]` with a bounded window.
 fn decoder(src: &Shared, pos: u64, len: u64) -> Result<Decoder> {
@@ -82,9 +83,7 @@ fn decoder(src: &Shared, pos: u64, len: u64) -> Result<Decoder> {
         pos,
         end: pos + len,
     };
-    let mut d = zstd::stream::read::Decoder::new(r)?;
-    d.window_log_max(MAX_WINDOW_LOG)?;
-    Ok(d)
+    ReadDecoder::new(r, MAX_WINDOW_LOG)
 }
 
 /// Turn an error of a zstd stream into an [`Error`]. Corrupt or truncated
@@ -429,8 +428,8 @@ mod tests {
         let m = serde_json::json!({
             "version": version, "size": orig.len(), "sha256": "", "segments": segs,
         });
-        let gap_stream = zstd::bulk::compress(&gaps, 3).unwrap();
-        let map = zstd::bulk::compress(m.to_string().as_bytes(), 3).unwrap();
+        let gap_stream = crate::zstd::compress(&gaps);
+        let map = crate::zstd::compress(m.to_string().as_bytes());
         let mut out = container.to_vec();
         out.extend_from_slice(&gap_stream);
         out.extend_from_slice(&map);
