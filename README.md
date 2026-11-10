@@ -36,6 +36,10 @@ fn main() -> libhac::Result<()> {
     for e in pfs.entries().iter().filter(|e| e.name.ends_with(".nca")) {
         let nca = Nca::open(&keys, SubStorage::new(&nsp, e.offset, e.size)?)?;
         println!("{} {} {}", e.name, nca.content_type(), nca.program_id());
+        // No signature is checked on open.
+        if !nca.verify_header_signature() {
+            println!("  header signature is invalid");
+        }
         if nca.content_type() == ContentType::CONTROL {
             let section = nca.open_section(nca.data_section_index(), &TitleKeys::new())?;
             let romfs = RomFs::open(&section)?;

@@ -14,22 +14,25 @@
 //! copied as is, with a trailing `1` when it is an NCZ to decompress.
 //! The gap stream is decompressed on demand, as the image is read.
 
-use super::{Image, Shared, open_entry};
-use crate::bytes::u64_le;
+use super::{Image, Shared, check_disjoint, open_entry};
+use crate::bytes::{quoted, u64_le};
 use crate::error::{Error, Result, fail};
 use crate::partition::{Entry, PartitionFs};
 use crate::storage::{ReadAt, check_range, read_array};
 use crate::xci::XciRoot;
 use crate::zstd::ReadDecoder;
 use serde::Deserialize;
-use serde_json::Value;
+use serde::de::{Deserializer, Error as _, IgnoredAny, SeqAccess, Visitor};
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
 
 const MAGIC: &[u8; 8] = b"NSZKEEP1";
 const FOOTER_SIZE: u64 = 24;
-const MAX_MAP: u64 = 16 << 20;
+/// Largest map, packed or not. The one of a card image with 200 files is
+/// under 8 KiB.
+const MAX_MAP: u64 = 1 << 20;
 /// Bound on the gap bytes kept in memory. Uniform fill blocks do not count.
 const MAX_LITERAL: u64 = 64 << 20;
 const FILL_BLOCK: usize = 0x200;
@@ -41,14 +44,75 @@ const MAX_RUNS: usize = 1 << 20;
 /// Largest zstd window accepted in the trailer streams (128 MiB).
 const MAX_WINDOW_LOG: u32 = 27;
 
+/// The version of a map. It is read on its own, since a map of another
+/// version may have another shape.
 #[derive(Deserialize)]
-struct KeepMap {
+struct MapVersion {
     #[serde(default, alias = "Version")]
     version: i64,
+}
+
+#[derive(Deserialize)]
+struct KeepMap {
     #[serde(default, alias = "Size")]
     size: u64,
     #[serde(default, alias = "Segments")]
-    segments: Vec<Vec<Value>>,
+    segments: Vec<MapSegment>,
+}
+
+/// A map segment: offset and length in the source, then nothing for gap
+/// bytes, or the partition and the index of a container file, with a
+/// trailing `1` when it is an NCZ to decompress.
+struct MapSegment {
+    off: u64,
+    len: u64,
+    /// Partition, index, and whether it is an NCZ.
+    file: Option<(String, u64, bool)>,
+}
+
+impl<'de> Deserialize<'de> for MapSegment {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Shape;
+
+        impl<'de> Visitor<'de> for Shape {
+            type Value = MapSegment;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("[offset, length] or [offset, length, partition, index], or the latter with a 1")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut s: A,
+            ) -> std::result::Result<MapSegment, A::Error> {
+                let short = |n| A::Error::invalid_length(n, &self);
+                let off = s.next_element()?.ok_or_else(|| short(0))?;
+                let len = s.next_element()?.ok_or_else(|| short(1))?;
+                let Some(part) = s.next_element::<String>()? else {
+                    return Ok(MapSegment {
+                        off,
+                        len,
+                        file: None,
+                    });
+                };
+                let idx = s.next_element()?.ok_or_else(|| short(3))?;
+                let ncz = match s.next_element::<u64>()? {
+                    None => false,
+                    Some(1) => true,
+                    Some(_) => return Err(A::Error::custom("bad NCZ flag")),
+                };
+                if s.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(short(6));
+                }
+                Ok(MapSegment {
+                    off,
+                    len,
+                    file: Some((part, idx, ncz)),
+                })
+            }
+        }
+        d.deserialize_seq(Shape)
+    }
 }
 
 /// Sequential reader over a byte range of a source.
@@ -131,21 +195,18 @@ pub fn build_keep(src: Shared, xci: bool) -> Result<Option<Image>> {
     if raw.len() as u64 > MAX_MAP {
         fail!(InvalidData, "--keep map: too large");
     }
-    let m: KeepMap =
-        serde_json::from_slice(&raw).map_err(|e| Error::InvalidData(format!("--keep map: {e}")))?;
-    if m.version != 1 {
+    let bad_map = |e| Error::InvalidData(format!("--keep map: {e}"));
+    let v: MapVersion = serde_json::from_slice(&raw).map_err(bad_map)?;
+    if v.version != 1 {
         return Ok(None);
     }
+    let m: KeepMap = serde_json::from_slice(&raw).map_err(bad_map)?;
 
-    // Gap segments are `[off, len]`; anything malformed fails below.
-    let gap_lens = m.segments.iter().filter(|s| s.len() == 2);
-    let Some(total) = gap_lens
-        .map(|s| s.get(1).and_then(Value::as_u64).unwrap_or(0))
-        .try_fold(0u64, u64::checked_add)
-    else {
+    let mut gap_lens = m.segments.iter().filter(|s| s.file.is_none());
+    let Some(total) = gap_lens.try_fold(0u64, |sum, s| sum.checked_add(s.len)) else {
         fail!(InvalidData, "--keep gaps too large");
     };
-    let files = container_files(&*src, xci)?;
+    let mut files = container_files(&*src, xci)?;
     let gaps = Arc::new(Gaps {
         src: Arc::clone(&src),
         off: gap_off,
@@ -156,16 +217,11 @@ pub fn build_keep(src: Shared, xci: bool) -> Result<Option<Image>> {
     let mut img = Image::default();
     let mut gap_pos = 0u64;
     let mut pos = 0u64;
-    for (i, seg) in m.segments.iter().enumerate() {
-        let off = seg.first().and_then(Value::as_u64);
-        let n = seg.get(1).and_then(Value::as_u64);
-        let (Some(off), Some(n)) = (off, n) else {
-            fail!(InvalidData, "--keep segment {i}: bad offset or length");
-        };
+    for (i, MapSegment { off, len: n, file }) in m.segments.into_iter().enumerate() {
         if off != pos || n > m.size - pos {
             fail!(InvalidData, "--keep segment {i}: bad offset or length");
         }
-        if seg.len() == 2 {
+        let Some((part, idx, ncz)) = file else {
             let g = GapSlice {
                 gaps: Arc::clone(&gaps),
                 start: gap_pos,
@@ -176,29 +232,24 @@ pub fn build_keep(src: Shared, xci: bool) -> Result<Option<Image>> {
             gap_pos += n;
             pos += n;
             continue;
-        }
-        let part = seg.get(2).and_then(Value::as_str);
-        let idx = seg.get(3).and_then(Value::as_u64);
-        let ncz = match seg.get(4) {
-            None => Some(false),
-            Some(v) => (v.as_i64() == Some(1)).then_some(true),
         };
-        let (Some(part), Some(idx), Some(ncz), true) = (part, idx, ncz, seg.len() <= 5) else {
-            fail!(InvalidData, "--keep segment {i}: bad file reference");
-        };
-        let Some(e) = files.get(&(part.to_string(), idx)) else {
+        // Taken out of the map: a file is in the source once, and a map
+        // that used it again would open it again each time.
+        let key = (part, idx);
+        let Some(e) = files.remove(&key) else {
             fail!(
                 InvalidData,
-                "--keep segment {i}: no file {idx} in partition {part:?}"
+                "--keep segment {i}: file {idx} of partition {} is missing or used twice",
+                quoted(&key.0)
             );
         };
-        let r = open_entry(&src, e, ncz)?;
+        let r = open_entry(&src, &e, ncz)?;
         let rs = r.size()?;
         if rs != n {
             fail!(
                 InvalidData,
                 "--keep segment {i}: {} is {rs} bytes, want {n}",
-                e.name
+                quoted(&e.name)
             );
         }
         img.add(pos, r, n);
@@ -270,7 +321,11 @@ impl GapState {
                 self.add_block(b)?;
             }
         }
-        self.dec = Some(dec);
+        // Past the last gap byte the decoder, with its window, is of no
+        // more use.
+        if self.decoded < g.total {
+            self.dec = Some(dec);
+        }
         Ok(())
     }
 
@@ -372,14 +427,17 @@ fn container_files(src: &dyn ReadAt, xci: bool) -> Result<HashMap<(String, u64),
     let mut files = HashMap::new();
     if !xci {
         let fs = PartitionFs::parse_pfs0(src)?;
+        check_disjoint(&fs)?;
         for (i, e) in fs.entries.into_iter().enumerate() {
             files.insert((String::new(), i as u64), e);
         }
         return Ok(files);
     }
     let x = XciRoot::parse(src)?;
+    check_disjoint(&x.root)?;
     for p in &x.root.entries {
         let fs = x.partition(src, p)?;
+        check_disjoint(&fs)?;
         for (i, e) in fs.entries.into_iter().enumerate() {
             files.insert((p.name.clone(), i as u64), e);
         }
@@ -392,9 +450,10 @@ mod tests {
     use super::super::tests::{fs, ncz_files, read_all};
     use super::super::{build, build_nsp, is_ncz};
     use super::*;
-    use crate::ncz::tests::check_random_reads;
+    use crate::ncz::tests::{check_random_reads, tiny_ncz};
     use crate::partition::PartitionKind;
     use crate::xci::MEDIA_UNIT;
+    use serde_json::Value;
 
     /// Append to `container` a trailer that restores `orig`, with the files
     /// of `h` (parsed from `orig`) taken from the container.
@@ -428,15 +487,7 @@ mod tests {
         let m = serde_json::json!({
             "version": version, "size": orig.len(), "sha256": "", "segments": segs,
         });
-        let gap_stream = crate::zstd::compress(&gaps);
-        let map = crate::zstd::compress(m.to_string().as_bytes());
-        let mut out = container.to_vec();
-        out.extend_from_slice(&gap_stream);
-        out.extend_from_slice(&map);
-        out.extend_from_slice(&(gap_stream.len() as u64).to_le_bytes());
-        out.extend_from_slice(&(map.len() as u64).to_le_bytes());
-        out.extend_from_slice(MAGIC);
-        out
+        with_map(container, &gaps, m.to_string().as_bytes())
     }
 
     /// `src` (with a trailer) with its gap stream changed by `f` and the
@@ -511,6 +562,145 @@ mod tests {
                 reads = n;
             }
         }
+    }
+
+    /// `container` with a trailer made of the gap bytes `gaps` and the map
+    /// `map`.
+    fn with_map(container: &[u8], gaps: &[u8], map: &[u8]) -> Vec<u8> {
+        let gaps = crate::zstd::compress(gaps);
+        let map = crate::zstd::compress(map);
+        let mut src = container.to_vec();
+        src.extend_from_slice(&gaps);
+        src.extend_from_slice(&map);
+        src.extend_from_slice(&(gaps.len() as u64).to_le_bytes());
+        src.extend_from_slice(&(map.len() as u64).to_le_bytes());
+        src.extend_from_slice(MAGIC);
+        src
+    }
+
+    /// Only the shapes nsz writes are segments, and only a map of version
+    /// 1 has to have them.
+    #[test]
+    fn map_shapes() {
+        let (ncz, nca) = tiny_ncz(false);
+        let nsz = fs(PartitionKind::Pfs0, &[("aaaa.ncz", ncz)], 1);
+        let n = nca.len();
+        let build = |map: Value| {
+            let src = with_map(&nsz, &[9; 4], map.to_string().as_bytes());
+            build_keep(Arc::new(src), false)
+        };
+        let segments =
+            |segs: Value| serde_json::json!({"version": 1, "size": n + 4, "segments": segs});
+
+        let v = build(segments(serde_json::json!([[0, n, "", 0, 1], [n, 4]])));
+        let v = v.unwrap().unwrap();
+        assert!(read_all(&v) == [&nca[..], &[9; 4]].concat());
+        for bad in [
+            serde_json::json!([[0, n, "", 0, 1], [n]]),
+            serde_json::json!([[0, n, "", 0, 1], [n, 4, ""]]),
+            serde_json::json!([[0, n, "", 0, 1], [n, 4, null, null]]),
+            serde_json::json!([[0, n, "", 0, 2], [n, 4]]),
+            serde_json::json!([[0, n, "", 0, 1, 1], [n, 4]]),
+            serde_json::json!([[0, n, 0, 0, 1], [n, 4]]),
+            serde_json::json!([[0, n, "", 0, 1], [n, -4]]),
+            serde_json::json!([[0, n, "", 0, 1], [n, 4.0]]),
+            serde_json::json!({"0": [0, n]}),
+        ] {
+            let r = build(segments(bad.clone()));
+            assert!(matches!(r, Err(Error::InvalidData(_))), "{bad}");
+        }
+        // Another version may look like anything.
+        let other = serde_json::json!({"version": 2, "size": "big", "segments": {"a": 1}});
+        assert!(matches!(build(other), Ok(None)));
+        assert!(build(serde_json::json!([1])).is_err());
+
+        let pad = "x".repeat(MAX_MAP as usize);
+        let big = serde_json::json!({"version": 1, "size": 0, "segments": [], "pad": pad});
+        let r = build(big);
+        assert!(matches!(&r, Err(Error::InvalidData(m)) if m.contains("too large")));
+    }
+
+    /// The decoder of the gap stream is dropped with its last byte.
+    #[test]
+    fn gap_decoder_is_dropped() {
+        let data: Vec<u8> = (0..3 * DECODE_CHUNK).map(|i| (i / 3) as u8).collect();
+        let packed = crate::zstd::compress(&data);
+        let gaps = Gaps {
+            len: packed.len() as u64,
+            src: Arc::new(packed),
+            off: 0,
+            total: data.len() as u64,
+            state: Mutex::default(),
+        };
+        let mut b = vec![0u8; 0x1000];
+        gaps.read(0, &mut b).unwrap();
+        assert!(b == data[..0x1000]);
+        assert!(gaps.state.lock().unwrap().dec.is_some());
+        gaps.read(gaps.total - 0x1000, &mut b).unwrap();
+        assert!(b == data[data.len() - 0x1000..]);
+        assert!(gaps.state.lock().unwrap().dec.is_none());
+        // Everything is indexed now: reads need no decoder.
+        gaps.read(0x800, &mut b).unwrap();
+        assert!(b == data[0x800..0x1800]);
+    }
+
+    /// Random changes to the map or to the end of the trailer never panic.
+    #[test]
+    fn fuzz_no_panic() {
+        let (ncz, nca) = tiny_ncz(false);
+        let files = [("aaaa.ncz", ncz), ("bbbb.tik", vec![7; 0x40])];
+        let plain = [("aaaa.nca", nca), ("bbbb.tik", vec![7; 0x40])];
+        let nsz = fs(PartitionKind::Pfs0, &files, 1);
+        let orig = fs(PartitionKind::Pfs0, &plain, MEDIA_UNIT as usize);
+        let h = PartitionFs::parse_pfs0(&orig).unwrap();
+        let good = append_trailer(&nsz, &orig, &h, &files, 1);
+        let try_build = |src: Vec<u8>| {
+            let Ok(Some(v)) = build_keep(Arc::new(src), false) else {
+                return;
+            };
+            crate::testutil::probe_reads(&v);
+        };
+
+        let foot = good.len() - FOOTER_SIZE as usize;
+        let map_off = foot - u64_le(&good, foot + 8) as usize;
+        let gap_size = u64_le(&good, foot);
+        let map = crate::zstd::decompress(&good[map_off..foot], MAX_MAP as usize).unwrap();
+        let mut enc = crate::zstd::Encoder::new().unwrap();
+        crate::testutil::fuzz(&map, 11, |m| {
+            let m = enc.compress(m).unwrap();
+            let mut src = good[..map_off].to_vec();
+            src.extend_from_slice(&m);
+            src.extend_from_slice(&gap_size.to_le_bytes());
+            src.extend_from_slice(&(m.len() as u64).to_le_bytes());
+            src.extend_from_slice(MAGIC);
+            try_build(src);
+        });
+        // The gap stream, the packed map and the footer.
+        let tail = good.len() - nsz.len();
+        crate::testutil::fuzz(&good[nsz.len()..], 12, |t| {
+            if t.len() == tail {
+                try_build([&nsz, t].concat());
+            }
+        });
+    }
+
+    /// A map that names one container file in every segment would open it
+    /// once per segment.
+    #[test]
+    fn file_used_twice() {
+        let (compressed, plain) = ncz_files();
+        let n = plain[0].1.len();
+        let m = serde_json::json!({
+            "version": 1, "size": 2 * n, "segments": [[0, n, "", 0], [n, n, "", 0]],
+        });
+        let container = fs(PartitionKind::Pfs0, &compressed, 1);
+        let src = with_map(&container, &[], m.to_string().as_bytes());
+        let r = build_keep(Arc::new(src), false);
+        assert!(
+            matches!(&r, Err(Error::InvalidData(m)) if m.contains("used twice")),
+            "{:?}",
+            r.err()
+        );
     }
 
     #[test]

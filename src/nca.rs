@@ -12,7 +12,7 @@ use crate::bytes::{array_at, open_enum, u16_le, u32_le, u64_le};
 use crate::crypto::{CtrKey, aes_ecb_decrypt, aes_xts_decrypt, verify_rsa_pss};
 use crate::error::{Error, Result, fail};
 use crate::keys::Keys;
-use crate::storage::{ReadAt, check_range, in_range};
+use crate::storage::{ReadAt, check_range, in_range, zeroed};
 use crate::types::{KeyGeneration, RightsId, TitleId};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
@@ -186,13 +186,29 @@ struct HashLevel {
     block_size: u64,
 }
 
+/// Largest hash tree block, as a power of two (1 MiB). A block is read
+/// whole, and an IVFC tree hashes it up to its full size even when it holds
+/// a few bytes. Real trees use blocks of 4 KiB to 64 KiB.
+const MAX_HASH_BLOCK_EXP: u32 = 20;
+
+/// Smallest hash tree block, as a power of two (512 bytes). Each block
+/// costs a hash, and each hash block read stays cached.
+const MIN_HASH_BLOCK_EXP: u32 = 9;
+
+/// Largest SHA256 hash table. It is read and kept whole. Real ones are at
+/// most a few tens of KiB.
+const MAX_HASH_TABLE: u64 = 16 << 20;
+
+/// A verified block.
+type Block = Rc<Vec<u8>>;
+
 /// Verified blocks: every block of the hash levels by level and index, and
 /// only the last block read of the data level, since caching all of those
 /// would keep every byte ever read in memory.
 #[derive(Default)]
 struct BlockCache {
-    hash: HashMap<(usize, u64), Rc<[u8]>>,
-    data: Option<(u64, Rc<[u8]>)>,
+    hash: HashMap<(usize, u64), Block>,
+    data: Option<(u64, Block)>,
 }
 
 /// Data level of a hash tree; every block read is checked up to the master hash.
@@ -207,7 +223,7 @@ struct VerifiedStorage<'a, S> {
 }
 
 impl<S: ReadAt> VerifiedStorage<'_, S> {
-    fn block(&self, level: usize, index: u64) -> Result<Rc<[u8]>> {
+    fn block(&self, level: usize, index: u64) -> Result<Block> {
         let is_data = level + 1 == self.levels.len();
         {
             let cache = self.cache.borrow();
@@ -225,12 +241,12 @@ impl<S: ReadAt> VerifiedStorage<'_, S> {
         if start >= l.size {
             fail!(OutOfRange, "hash block out of range");
         }
-        let len = l.block_size.min(l.size - start) as usize;
-        // Read straight into the shared buffer. The level was checked to lie
-        // inside the section when it was opened, so `len` is bounded.
-        let mut data: Rc<[u8]> = std::iter::repeat_n(0, len).collect();
-        self.base
-            .read_at(l.offset + start, Rc::get_mut(&mut data).unwrap())?;
+        // The level was checked to lie inside the section when it was
+        // opened. The first level of a SHA256 tree is still one block, of
+        // up to `MAX_HASH_TABLE`.
+        let mut data = zeroed(l.block_size.min(l.size - start))?;
+        self.base.read_at(l.offset + start, &mut data)?;
+        let data = Rc::new(data);
 
         let expected = if level == 0 {
             if index != 0 {
@@ -244,7 +260,7 @@ impl<S: ReadAt> VerifiedStorage<'_, S> {
         };
 
         let mut h = Sha256::new();
-        h.update(&*data);
+        h.update(&**data);
         if self.zero_pad {
             // The padding is hashed in small chunks, since the block size
             // comes from the file.
@@ -313,6 +329,10 @@ const COMPRESSED_ENTRY_SIZE: usize = 0x18;
 const COMPRESSION_NONE: u8 = 0;
 const COMPRESSION_ZEROS: u8 = 1;
 const COMPRESSION_LZ4: u8 = 3;
+
+/// Largest LZ4 entry, packed or not: it is decompressed whole. Real ones
+/// hold up to 64 KiB.
+const MAX_LZ4_ENTRY: u64 = 1 << 20;
 
 /// One `CompressedStorage` entry: a virtual range backed by `phys_size`
 /// bytes at `phys` in the verified data level.
@@ -385,7 +405,10 @@ fn bucket_tree(
             table_offset + node_storage + set as u64 * node_size,
             BKTR_NODE_SIZE,
         )?;
-        let n = (u32_le(&node, 4) as usize).min(per_set);
+        let n = u32_le(&node, 4) as usize;
+        if n > per_set {
+            fail!(InvalidData, "Invalid {what} table");
+        }
         for k in 0..n {
             let e = &node[BKTR_NODE_HEADER + k * entry_size..][..entry_size];
             let off = u64_le(e, 0);
@@ -443,9 +466,16 @@ impl<'a, S: ReadAt> CompressedStorage<'a, S> {
 
     /// Decompressed bytes of LZ4 entry `e`, which is `len` bytes long.
     fn decompress_lz4(&self, e: &CompressedEntry, len: u64) -> Result<Vec<u8>> {
+        // Checked before allocating, since both sizes come from the file.
+        if len > MAX_LZ4_ENTRY || e.phys_size as u64 > MAX_LZ4_ENTRY {
+            fail!(
+                InvalidData,
+                "LZ4 entry of {} bytes for {len} is too large",
+                e.phys_size
+            );
+        }
         // An LZ4 block expands at most about 255 times (one 0xFF length
-        // byte per 255 output bytes), so a larger length is corrupt. Check
-        // before allocating, since `len` comes from the file.
+        // byte per 255 output bytes), so a larger length is corrupt.
         if len > (e.phys_size as u64 + 1) * 255 {
             fail!(
                 InvalidData,
@@ -453,12 +483,7 @@ impl<'a, S: ReadAt> CompressedStorage<'a, S> {
                 e.phys_size
             );
         }
-        let Ok(len) = usize::try_from(len) else {
-            fail!(
-                InvalidData,
-                "LZ4 entry of {len} bytes does not fit in memory"
-            );
-        };
+        let len = len as usize;
         let packed = self.base.read_vec(e.phys, e.phys_size as usize)?;
         let mut out = vec![0; len];
         let n = lz4_flex::block::decompress_into(&packed, &mut out)
@@ -619,8 +644,10 @@ impl<S> Nca<S> {
 }
 
 impl<S: ReadAt> Nca<S> {
-    /// Decrypt and parse the header, and decrypt the key area when its key
-    /// is in `keys`.
+    /// Decrypt and parse the header, check the hash of the FS header of
+    /// every section in use, and decrypt the key area when its key is in
+    /// `keys`. No signature is checked here: see
+    /// [`Nca::verify_header_signature`].
     pub fn open(keys: &Keys, storage: S) -> Result<Self> {
         if storage.size()? < 0xC00 {
             fail!(InvalidData, "NCA too small");
@@ -655,7 +682,22 @@ impl<S: ReadAt> Nca<S> {
             nca.key_area_ctr = Some(key);
         }
         nca.titlekek = keys.titlekek(rev).copied();
+        nca.check_fs_headers()?;
         Ok(nca)
+    }
+
+    /// LibHac `NcaHeader.GetFsHeader`: the signed header holds a SHA256 of
+    /// each FS header. LibHac checks it at every use of an FS header; here
+    /// it is checked once, so that no caller reads a field of a header that
+    /// fails it.
+    fn check_fs_headers(&self) -> Result<()> {
+        for i in SectionIndex::all().filter(|&i| self.is_section_enabled(i)) {
+            let h = 0x280 + i.get() * 0x20;
+            if Sha256::digest(self.fs_header(i).raw).as_slice() != &self.header[h..h + 0x20] {
+                fail!(InvalidData, "FS header hash is invalid.");
+            }
+        }
+        Ok(())
     }
 
     /// Download or game card.
@@ -705,6 +747,10 @@ impl<S: ReadAt> Nca<S> {
 
     /// Check signature 2 of the header against `modulus`, the ACID modulus
     /// of the program's `main.npdm` (see [`crate::npdm::acid_modulus`]).
+    ///
+    /// The modulus comes from the NCA itself, so this alone proves nothing:
+    /// whoever writes the header can put a key of their own in the NPDM. It
+    /// only has a meaning together with [`Nca::verify_header_signature`].
     pub fn verify_signature2(&self, modulus: &[u8]) -> bool {
         verify_rsa_pss(
             modulus,
@@ -728,7 +774,8 @@ impl<S: ReadAt> Nca<S> {
         start != 0 || end != start
     }
 
-    /// The FS header of section `i`.
+    /// The FS header of section `i`. Its hash was checked by [`Nca::open`]
+    /// when the section is in use.
     pub fn fs_header(&self, i: SectionIndex) -> FsHeader<'_> {
         let o = 0x400 + i.get() * 0x200;
         FsHeader {
@@ -837,11 +884,6 @@ impl<S: ReadAt> Nca<S> {
             fail!(InvalidData, "Section {i} is empty");
         }
         let fsh = self.fs_header(i);
-        // LibHac `NcaHeader.GetFsHeader`: the signed header holds a SHA256 of each FS header.
-        let h = 0x280 + i.get() * 0x20;
-        if Sha256::digest(fsh.raw).as_slice() != &self.header[h..h + 0x20] {
-            fail!(InvalidData, "FS header hash is invalid.");
-        }
         if fsh.is_patch_section() {
             fail!(Unsupported, "Patch sections are not supported");
         }
@@ -880,7 +922,13 @@ impl<S: ReadAt> Nca<S> {
                 let master: [u8; 32] = array_at(raw, 0x08)?;
                 let block_size = u32_le(raw, 0x28) as u64;
                 let count = u32_le(raw, 0x2C) as usize;
-                if !(2..=5).contains(&count) || block_size == 0 {
+                // Two levels: the hash table, as one block, and the data.
+                // LibHac reads those two whatever the count says.
+                let exps = MIN_HASH_BLOCK_EXP..=MAX_HASH_BLOCK_EXP;
+                if count != 2
+                    || !block_size.is_power_of_two()
+                    || !exps.contains(&block_size.trailing_zeros())
+                {
                     fail!(InvalidData, "Invalid hierarchical SHA256 header");
                 }
                 let levels = (0..count)
@@ -894,6 +942,11 @@ impl<S: ReadAt> Nca<S> {
                         }
                     })
                     .collect::<Vec<_>>();
+                // The table holds one hash per data block, no more.
+                let want = levels[1].size.div_ceil(block_size).checked_mul(32);
+                if want != Some(levels[0].size) || levels[0].size > MAX_HASH_TABLE {
+                    fail!(InvalidData, "Invalid hierarchical SHA256 table size");
+                }
                 (levels, master, false)
             }
             HashType::IVFC => {
@@ -907,13 +960,17 @@ impl<S: ReadAt> Nca<S> {
                 let levels = (0..count - 1)
                     .map(|l| {
                         let o = 0x18 + l * 0x18;
-                        HashLevel {
+                        let exp = u32_le(raw, o + 0x10);
+                        if !(MIN_HASH_BLOCK_EXP..=MAX_HASH_BLOCK_EXP).contains(&exp) {
+                            fail!(InvalidData, "Invalid IVFC block size");
+                        }
+                        Ok(HashLevel {
                             offset: u64_le(raw, o),
                             size: u64_le(raw, o + 8),
-                            block_size: 1u64 << u32_le(raw, o + 0x10).min(31),
-                        }
+                            block_size: 1 << exp,
+                        })
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()?;
                 (levels, array_at(raw, 0xC8)?, true)
             }
             t => fail!(Unsupported, "Unsupported hash type {}", t.0),
@@ -1076,21 +1133,251 @@ mod tests {
         assert!(c.read_vec(0x18, 9).is_err());
     }
 
-    #[test]
-    fn oversized_lz4_entry_is_an_error() {
-        // One LZ4 entry of 0x10 packed bytes claiming 1 TiB of output.
+    /// Data level with one LZ4 entry of `size` bytes, `packed` when
+    /// compressed.
+    fn lz4_level(size: u64, packed: &[u8]) -> Vec<u8> {
         let mut data = vec![0u8; 0x8000];
-        data[8..16].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        data[8..16].copy_from_slice(&size.to_le_bytes());
         let set = &mut data[0x4000..];
         set[4..8].copy_from_slice(&1u32.to_le_bytes());
         let e = &mut set[BKTR_NODE_HEADER..];
         e[8..16].copy_from_slice(&0x8000u64.to_le_bytes());
         e[0x10] = COMPRESSION_LZ4;
-        e[0x14..0x18].copy_from_slice(&0x10u32.to_le_bytes());
-        data.extend([0; 0x10]);
-        let backing = tree(&data);
-        let c = CompressedStorage::open(verified(&backing), &info(0x8000, 1)).unwrap();
-        assert!(matches!(c.read_vec(0, 1), Err(Error::InvalidData(_))));
+        e[0x14..0x18].copy_from_slice(&(packed.len() as u32).to_le_bytes());
+        data.extend(packed);
+        data
+    }
+
+    /// An LZ4 block of `len` bytes: the literal `A`, a match that repeats
+    /// it, and the literals `BCDEF`.
+    fn lz4_run(len: u64) -> Vec<u8> {
+        // The match is 19 bytes long plus the sum of the bytes after its
+        // offset, which ends with the first one below 255.
+        let more = len - 25;
+        let mut b = vec![0x1F, b'A', 1, 0];
+        b.resize(b.len() + (more / 255) as usize, 255);
+        b.push((more % 255) as u8);
+        b.extend(b"\x50BCDEF");
+        b
+    }
+
+    #[test]
+    fn oversized_lz4_entry_is_an_error() {
+        // 0x10 packed bytes claiming 1 TiB of output, then a valid block
+        // of one byte more than an entry may hold.
+        let over = MAX_LZ4_ENTRY + 1;
+        for (size, packed) in [(1 << 40, vec![0; 0x10]), (over, lz4_run(over))] {
+            let backing = tree(&lz4_level(size, &packed));
+            let c = CompressedStorage::open(verified(&backing), &info(0x8000, 1)).unwrap();
+            assert!(matches!(c.read_vec(0, 1), Err(Error::InvalidData(_))));
+        }
+    }
+
+    #[test]
+    fn lz4_entry() {
+        for size in [25, MAX_LZ4_ENTRY] {
+            let backing = tree(&lz4_level(size, &lz4_run(size)));
+            let c = CompressedStorage::open(verified(&backing), &info(0x8000, 1)).unwrap();
+            assert_eq!(c.read_vec(0, 3).unwrap(), b"AAA");
+            assert_eq!(c.read_vec(size - 7, 4).unwrap(), b"AABC");
+            assert_eq!(c.read_vec(size - 5, 5).unwrap(), b"BCDEF");
+            assert!(c.read_vec(size - 7, 8).is_err());
+        }
+    }
+
+    /// An entry set cannot hold more entries than fit in its node.
+    #[test]
+    fn entry_set_count() {
+        let per_set = (BKTR_NODE_SIZE - BKTR_NODE_HEADER) / COMPRESSED_ENTRY_SIZE;
+        let mut data = vec![0u8; 0x8000];
+        data[8..16].copy_from_slice(&(per_set as u64 * 0x10).to_le_bytes());
+        for k in 0..per_set {
+            let e = &mut data[0x4000 + BKTR_NODE_HEADER + k * COMPRESSED_ENTRY_SIZE..];
+            e[..8].copy_from_slice(&(k as u64 * 0x10).to_le_bytes());
+            e[0x10] = COMPRESSION_ZEROS;
+        }
+        for (count, ok) in [(per_set, true), (per_set + 1, false)] {
+            data[0x4004..0x4008].copy_from_slice(&(count as u32).to_le_bytes());
+            let backing = tree(&data);
+            let c = CompressedStorage::open(verified(&backing), &info(0x8000, per_set as u32));
+            assert_eq!(c.is_ok(), ok, "{count} entries");
+        }
+    }
+
+    const HEADER_KEY: [u8; 32] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31,
+    ];
+
+    /// Start of section 0 in the test NCAs: right after the header.
+    const BODY: usize = 0xC00;
+
+    fn put(h: &mut [u8], at: usize, v: u64, len: usize) {
+        h[at..at + len].copy_from_slice(&v.to_le_bytes()[..len]);
+    }
+
+    /// FS header of an unencrypted section with a SHA256 tree over `data`
+    /// in blocks of `block` bytes, and the section: the hash table, then
+    /// the data.
+    fn sha256_section(data: &[u8], block: usize) -> ([u8; 0x200], Vec<u8>) {
+        let mut body: Vec<u8> = data.chunks(block).flat_map(Sha256::digest).collect();
+        let table = body.len();
+        let mut h = [0u8; 0x200];
+        h[2..5].copy_from_slice(&[FsType::PFS0.0, HashType::SHA256.0, EncryptionType::NONE.0]);
+        h[0x08..0x28].copy_from_slice(&Sha256::digest(&body));
+        put(&mut h, 0x28, block as u64, 4);
+        put(&mut h, 0x2C, 2, 4);
+        for (l, (offset, size)) in [(0, table), (table, data.len())].into_iter().enumerate() {
+            put(&mut h, 0x30 + l * 0x10, offset as u64, 8);
+            put(&mut h, 0x38 + l * 0x10, size as u64, 8);
+        }
+        body.extend_from_slice(data);
+        (h, body)
+    }
+
+    /// The same for an IVFC tree with one hash level, in blocks of
+    /// `1 << exp` bytes. A short block is hashed padded with zeros.
+    fn ivfc_section(data: &[u8], exp: u32) -> ([u8; 0x200], Vec<u8>) {
+        let bs = 1 << exp;
+        let hash = |b: &[u8]| {
+            let mut v = b.to_vec();
+            v.resize(bs, 0);
+            Sha256::digest(&v)
+        };
+        let mut body: Vec<u8> = data.chunks(bs).flat_map(hash).collect();
+        let table = body.len();
+        let mut h = [0u8; 0x200];
+        h[2..5].copy_from_slice(&[FsType::ROMFS.0, HashType::IVFC.0, EncryptionType::NONE.0]);
+        h[0x08..0x0C].copy_from_slice(b"IVFC");
+        put(&mut h, 0x14, 3, 4);
+        h[0xC8..0xE8].copy_from_slice(&hash(&body));
+        body.resize(table.next_multiple_of(bs), 0);
+        for (l, (offset, size)) in [(0, table), (body.len(), data.len())]
+            .into_iter()
+            .enumerate()
+        {
+            put(&mut h, 0x18 + l * 0x18, offset as u64, 8);
+            put(&mut h, 0x20 + l * 0x18, size as u64, 8);
+            put(&mut h, 0x28 + l * 0x18, exp as u64, 4);
+        }
+        body.extend_from_slice(data);
+        (h, body)
+    }
+
+    /// An NCA3 with `body` as section 0, described by `fsh`. `tweak`
+    /// changes the header before it is encrypted.
+    fn nca(fsh: &[u8; 0x200], body: &[u8], tweak: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        let end = (BODY + body.len()).div_ceil(0x200);
+        let mut h = vec![0u8; BODY];
+        h[0x200..0x204].copy_from_slice(b"NCA3");
+        h[0x205] = ContentType::META.0;
+        put(&mut h, 0x240, (BODY / 0x200) as u64, 4);
+        put(&mut h, 0x244, end as u64, 4);
+        h[0x280..0x2A0].copy_from_slice(&Sha256::digest(fsh));
+        h[0x400..0x600].copy_from_slice(fsh);
+        tweak(&mut h);
+        crate::crypto::aes_xts_encrypt(&HEADER_KEY, &mut h, 0x200, 0);
+        h.extend_from_slice(body);
+        h.resize(end * 0x200, 0);
+        h
+    }
+
+    /// The first `len` bytes of section 0 of `img`.
+    fn read_section(img: Vec<u8>, len: usize) -> Result<Vec<u8>> {
+        let nca = Nca::open(&Keys::with_header_key(HEADER_KEY), img)?;
+        let s = nca.open_section(SectionIndex(0), &TitleKeys::new())?;
+        s.read_vec(0, len.min(s.size()? as usize))
+    }
+
+    fn test_data() -> Vec<u8> {
+        (0..0x2345u32).map(|i| (i * 7 + i / 256) as u8).collect()
+    }
+
+    #[test]
+    fn open_and_read_sections() {
+        let data = test_data();
+        for (name, (fsh, body)) in [
+            ("sha256", sha256_section(&data, 0x1000)),
+            ("ivfc", ivfc_section(&data, 10)),
+        ] {
+            let img = nca(&fsh, &body, |_| {});
+            let nca = Nca::open(&Keys::with_header_key(HEADER_KEY), img.clone()).unwrap();
+            assert_eq!(nca.content_type(), ContentType::META);
+            assert!(nca.is_section_enabled(SectionIndex(0)));
+            assert!(!nca.is_section_enabled(SectionIndex(1)));
+            assert!(nca.can_open_section(SectionIndex(0), &TitleKeys::new()));
+            // Not signed by the fixed key.
+            assert!(!nca.verify_header_signature());
+            let s = nca
+                .open_section(SectionIndex(0), &TitleKeys::new())
+                .unwrap();
+            assert_eq!(s.size().unwrap(), data.len() as u64, "{name}");
+            assert!(s.read_vec(0, data.len()).unwrap() == data, "{name}");
+            assert_eq!(s.read_vec(0x1ffe, 4).unwrap(), data[0x1ffe..0x2002]);
+
+            // A changed data byte fails its block, a changed hash the table.
+            let at = BODY + body.len() - 1;
+            let block = (data.len() as u64 - 1) / if name == "ivfc" { 0x400 } else { 0x1000 };
+            for (at, want) in [(at, (1, block)), (BODY + 0x21, (0, 0))] {
+                let mut bad = img.clone();
+                bad[at] ^= 1;
+                let r = read_section(bad, data.len());
+                assert!(
+                    matches!(r, Err(Error::HashMismatch { level, block }) if (level, block) == want),
+                    "{name} at {at:#x}: {:?}",
+                    r.err()
+                );
+            }
+        }
+        assert!(Nca::open(&Keys::with_header_key([9; 32]), vec![0; BODY]).is_err());
+    }
+
+    /// The header holds a hash of the FS header of each section in use.
+    #[test]
+    fn fs_header_hash() {
+        let (fsh, body) = sha256_section(&[1; 0x100], 0x1000);
+        // The byte that makes it a patch section, which callers skip.
+        let img = nca(&fsh, &body, |h| h[0x400 + 0x108] = 1);
+        let r = Nca::open(&Keys::with_header_key(HEADER_KEY), img).err();
+        assert!(matches!(&r, Some(Error::InvalidData(m)) if m == "FS header hash is invalid."));
+        // The FS header of a section that is not in use is not looked at.
+        let r = read_section(nca(&fsh, &body, |h| h[0x600] = 1), 1);
+        assert_eq!(r.unwrap(), [1]);
+    }
+
+    /// Block sizes come from the file: a block is read and hashed whole.
+    #[test]
+    fn hash_block_limits() {
+        let data = [1; 0x100];
+        let max = 1 << MAX_HASH_BLOCK_EXP;
+        let (fsh, body) = sha256_section(&data, max);
+        assert_eq!(read_section(nca(&fsh, &body, |_| {}), 1).unwrap(), [1]);
+        let min = 1u64 << MIN_HASH_BLOCK_EXP;
+        let bad = [
+            (0x28, max as u64 + 1),
+            (0x28, 0),
+            (0x28, min / 2),
+            // Not a power of two.
+            (0x28, 3 * min),
+            (0x2C, 3),
+            // Table size, one hash too large.
+            (0x38, 0x40),
+        ];
+        for (at, v) in bad {
+            let mut f = fsh;
+            put(&mut f, at, v, 4);
+            let r = read_section(nca(&f, &body, |_| {}), 1);
+            assert!(matches!(r, Err(Error::InvalidData(_))), "{at:#x}={v:#x}");
+        }
+
+        let (fsh, body) = ivfc_section(&data, 10);
+        assert_eq!(read_section(nca(&fsh, &body, |_| {}), 1).unwrap(), [1]);
+        for exp in [MAX_HASH_BLOCK_EXP + 1, MIN_HASH_BLOCK_EXP - 1] {
+            let mut f = fsh;
+            put(&mut f, 0x28 + 0x18, exp as u64, 4);
+            let r = read_section(nca(&f, &body, |_| {}), 1);
+            assert!(matches!(r, Err(Error::InvalidData(_))), "exp {exp}");
+        }
     }
 
     #[test]

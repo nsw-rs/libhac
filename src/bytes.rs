@@ -48,6 +48,16 @@ pub fn c_string(b: &[u8]) -> String {
     String::from_utf8_lossy(c_str(b)).into_owned()
 }
 
+/// `name` for an error message: quoted, with control characters escaped,
+/// and cut after 64 characters. Names come from file data and can be as
+/// long as the table that holds them.
+pub fn quoted(name: &str) -> String {
+    match name.char_indices().nth(64) {
+        Some((cut, _)) => format!("{:?}...", &name[..cut]),
+        None => format!("{name:?}"),
+    }
+}
+
 /// Define a `#[repr(transparent)]` newtype over an on-disk integer field
 /// with named associated constants. Unknown values are kept as they are.
 macro_rules! open_enum {
@@ -110,3 +120,17 @@ macro_rules! open_enum {
     };
 }
 pub(crate) use open_enum;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoted_names() {
+        assert_eq!(quoted("a.nca"), "\"a.nca\"");
+        assert_eq!(quoted("a\nb\u{1b}"), "\"a\\nb\\u{1b}\"");
+        let long = "\u{e9}".repeat(1000);
+        assert_eq!(quoted(&long), format!("{:?}...", "\u{e9}".repeat(64)));
+        assert_eq!(quoted(&long[..128]), format!("{:?}", &long[..128]));
+    }
+}

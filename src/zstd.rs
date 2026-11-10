@@ -21,6 +21,9 @@ const LEVEL: i32 = 19;
 /// `ZSTD_versionNumber` of the pinned libzstd (1.5.5).
 const LIBZSTD_VERSION: u32 = 10505;
 
+/// Magic of a zstd frame.
+pub(crate) const MAGIC: [u8; 4] = z::ZSTD_MAGICNUMBER.to_le_bytes();
+
 fn check(code: usize) -> Result<usize> {
     // SAFETY: both functions only inspect the code; the name is a static
     // string.
@@ -93,8 +96,9 @@ impl Encoder {
     pub(crate) fn compress(&mut self, src: &[u8]) -> Result<Vec<u8>> {
         // SAFETY: `cctx` is a valid context, between frames.
         check(unsafe { z::ZSTD_CCtx_setPledgedSrcSize(self.cctx, src.len() as u64) })?;
-        // SAFETY: pure function.
-        let mut out = Vec::with_capacity(unsafe { z::ZSTD_compressBound(src.len()) });
+        // SAFETY: pure function. It returns an error code for a size past
+        // what zstd takes.
+        let mut out = Vec::with_capacity(check(unsafe { z::ZSTD_compressBound(src.len()) })?);
         self.run(src, z::ZSTD_EndDirective::ZSTD_e_continue, &mut out)?;
         self.run(&[], z::ZSTD_EndDirective::ZSTD_e_flush, &mut out)?;
         self.run(&[], z::ZSTD_EndDirective::ZSTD_e_end, &mut out)?;

@@ -33,6 +33,11 @@ fn name_at(b: &[u8], o: usize, len_off: usize) -> Result<&[u8]> {
 
 /// `prefix/name`, failing past [`MAX_PATH`].
 fn join(prefix: &str, name: &[u8]) -> Result<String> {
+    // Checked before the name is copied: it can be as long as its table.
+    // Checked again after: a byte that is not UTF-8 becomes 3 bytes.
+    if prefix.len() + 1 + name.len() > MAX_PATH {
+        fail!(InvalidData, "RomFS path too long");
+    }
     let path = format!("{prefix}/{}", String::from_utf8_lossy(name));
     if path.len() > MAX_PATH {
         fail!(InvalidData, "RomFS path too long");
@@ -127,9 +132,14 @@ impl RomFs {
     }
 
     /// Read the data of `file` from `src`, which must be the storage
-    /// passed to [`RomFs::open`].
+    /// passed to [`RomFs::open`]. All of it goes into memory, and its size
+    /// comes from the RomFS tables: check [`RomFsFile::size`] first when
+    /// the image is not trusted.
     pub fn read_file<R: ReadAt + ?Sized>(&self, src: &R, file: &RomFsFile) -> Result<Vec<u8>> {
-        src.read_vec(file.offset, file.size as usize)
+        let Ok(size) = usize::try_from(file.size) else {
+            fail!(OutOfRange, "RomFS file too large");
+        };
+        src.read_vec(file.offset, size)
     }
 
     /// Read file `name` from the root directory of the RomFS in `src`,
@@ -338,6 +348,16 @@ mod tests {
         let img = image(&dirs, &files, DATA);
         let fs = RomFs::open(&img).unwrap();
         assert!(matches!(fs.files(), Err(Error::InvalidData(_))));
+    }
+
+    /// The limit holds for the path as returned, where each byte that is
+    /// not UTF-8 takes 3.
+    #[test]
+    fn path_limit() {
+        let prefix = "a".repeat(MAX_PATH - 11);
+        assert_eq!(join(&prefix, &[b'b'; 10]).unwrap().len(), MAX_PATH);
+        assert!(join(&prefix, &[b'b'; 11]).is_err());
+        assert!(join(&prefix, &[0xFF; 10]).is_err());
     }
 
     #[test]

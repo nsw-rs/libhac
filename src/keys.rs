@@ -116,6 +116,20 @@ impl Keys {
     }
 }
 
+#[cfg(test)]
+impl Keys {
+    /// A key set with nothing but the header key.
+    pub(crate) fn with_header_key(header_key: [u8; 32]) -> Self {
+        Keys {
+            header_key,
+            key_area_keys: HashMap::new(),
+            titlekeks: HashMap::new(),
+            eticket_rsa_keypair: None,
+            skipped: Vec::new(),
+        }
+    }
+}
+
 /// Shows which keys are present, never their values.
 impl fmt::Debug for Keys {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

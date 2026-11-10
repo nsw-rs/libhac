@@ -54,6 +54,33 @@ pub fn aes_xts_decrypt(key: &[u8; 32], data: &mut [u8], sector_size: usize, firs
     }
 }
 
+/// The inverse of [`aes_xts_decrypt`], to build test headers.
+#[cfg(test)]
+pub(crate) fn aes_xts_encrypt(
+    key: &[u8; 32],
+    data: &mut [u8],
+    sector_size: usize,
+    first_sector: u128,
+) {
+    let (halves, _) = key.as_chunks::<16>();
+    let data_cipher = aes(&halves[0]);
+    let tweak_cipher = aes(&halves[1]);
+    for (i, sector) in data.chunks_mut(sector_size).enumerate() {
+        let mut t = Block::<Aes128>::from((first_sector + i as u128).to_be_bytes());
+        tweak_cipher.encrypt_block(&mut t);
+        let mut tweak = u128::from_le_bytes(t.into());
+        for chunk in sector.as_chunks_mut::<16>().0 {
+            let x = tweak.to_le_bytes();
+            let mut blk = Block::<Aes128>::from(std::array::from_fn(|k| chunk[k] ^ x[k]));
+            data_cipher.encrypt_block(&mut blk);
+            for k in 0..16 {
+                chunk[k] = blk[k] ^ x[k];
+            }
+            tweak = (tweak << 1) ^ ((tweak >> 127) * 0x87);
+        }
+    }
+}
+
 /// An AES-128-CTR key and the high half of its counter, with the key
 /// schedule expanded once.
 #[derive(Clone)]
@@ -121,6 +148,50 @@ pub fn verify_rsa_pss(modulus: &[u8], message: &[u8], signature: &[u8]) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::RSA_N;
+
+    /// FIPS-197 appendix C.1.
+    #[test]
+    fn ecb_known_answer() {
+        let key: [u8; 16] = std::array::from_fn(|i| i as u8);
+        let mut b = hex::decode("69c4e0d86a7b0430d8cdb78070b4c55a").unwrap();
+        // A trailing partial block is left as it is.
+        b.extend([1, 2, 3]);
+        aes_ecb_decrypt(&key, &mut b);
+        assert_eq!(hex::encode(b), "00112233445566778899aabbccddeeff010203");
+    }
+
+    /// Sectors 5 and 6 of 0x20 bytes each, encrypted by another
+    /// implementation with the big-endian sector number as the tweak.
+    #[test]
+    fn xts_known_answer() {
+        let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let plain: Vec<u8> = (0..0x40).collect();
+        let sealed = hex::decode(
+            "bb6282966bcde70df1f603e50a5a4ebaab1089a06d675e03263b36783d572c72360f6c4eb8291d7861c0d71104afa8ec9118816f8ff66dd92da7797d0976fae4",
+        )
+        .unwrap();
+        let mut b = sealed.clone();
+        aes_xts_decrypt(&key, &mut b, 0x20, 5);
+        assert_eq!(b, plain);
+        aes_xts_encrypt(&key, &mut b, 0x20, 5);
+        assert_eq!(b, sealed);
+    }
+
+    /// A signature made by another implementation: SHA256, MGF1 with
+    /// SHA256, 32 bytes of salt.
+    #[test]
+    fn pss_known_answer() {
+        let n = hex::decode(RSA_N).unwrap();
+        let msg: Vec<u8> = (0..0x200u32).map(|i| (i * 3) as u8).collect();
+        let mut sig = hex::decode("414ad6399dbe72b8594191cd129d7e0dd421449069ba18625cd29378dca03e2b5d95f1415add347de8ced3f2b7dec621788986f09170b0027eaec07c994051a732f6668e620cacecf61bd53da6fdf55404568622cd396c7db055e21bc98d6ab0bff5a587100317b82241026e1861c7229911a528aa4ede314aa7dd0f223256ee8e92516bb055d8a753e592eb99d6ae3d2dcb59f13fdecfd8971c1130905cf5d9d5e5fecd8f98f109ed147485b9b70b3d8ff1968f7979753da6364d9b72097b781123e93e43852c2eb57ef65c04e1254ee649f4f3b89f2b3081e3c13bd33f5641b0ed16143dd084b94f7c7715f72416f03eb754a4d2610bc90bec13a27b8f56da").unwrap();
+        assert!(verify_rsa_pss(&n, &msg, &sig));
+        assert!(!verify_rsa_pss(&n, &msg[1..], &sig));
+        assert!(!verify_rsa_pss(&n[1..], &msg, &sig));
+        assert!(!verify_rsa_pss(&[], &msg, &sig));
+        sig[0x80] ^= 1;
+        assert!(!verify_rsa_pss(&n, &msg, &sig));
+    }
 
     #[test]
     fn ctr_is_an_involution_at_any_aligned_offset() {

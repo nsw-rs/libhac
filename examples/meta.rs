@@ -46,6 +46,9 @@ fn dump(keys: &Keys, path: &Path) -> libhac::Result<()> {
     }
     for e in pfs.entries().iter().filter(|e| e.name.ends_with(".nca")) {
         let nca = Nca::open(keys, SubStorage::new(&nsp, e.offset, e.size)?)?;
+        if !nca.verify_header_signature() {
+            println!("{}: header signature is invalid", e.name);
+        }
         let data = nca.data_section_index();
         match nca.content_type() {
             ContentType::META => {

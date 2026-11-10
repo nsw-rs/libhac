@@ -5,7 +5,7 @@
 
 //! XCI (game card image) header and partition table.
 
-use crate::bytes::u64_le;
+use crate::bytes::{quoted, u64_le};
 use crate::error::{Result, fail};
 use crate::partition::{Entry, MAX_HEADER, PartitionFs, PartitionKind};
 use crate::storage::{ReadAt, read_array};
@@ -91,7 +91,7 @@ impl XciRoot {
     pub fn partition<R: ReadAt + ?Sized>(&self, src: &R, p: &Entry) -> Result<PartitionFs> {
         // The root parse checked that the partition end does not overflow.
         PartitionFs::parse(src, p.offset, p.offset + p.size, PartitionKind::Hfs0)
-            .map_err(|e| e.prefixed(&format!("partition {}", p.name)))
+            .map_err(|e| e.prefixed(&format!("partition {}", quoted(&p.name))))
     }
 }
 

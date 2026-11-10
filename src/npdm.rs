@@ -63,6 +63,10 @@ fn locate(b: &[u8]) -> Result<(&[u8], &[u8], &[u8])> {
 
 /// The ACID RSA-2048 modulus that signs the NCA header (signature 2) of the
 /// program NCA holding this `main.npdm`.
+///
+/// The signature of the ACID itself is not checked, so the modulus is only
+/// as good as the NPDM it comes from: see
+/// [`Nca::verify_signature2`](crate::nca::Nca::verify_signature2).
 pub fn acid_modulus(b: &[u8]) -> Result<Vec<u8>> {
     let (_, _, acid) = locate(b)?;
     Ok(acid[0x100..0x200].to_vec())

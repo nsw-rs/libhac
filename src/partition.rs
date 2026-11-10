@@ -6,7 +6,7 @@
 //! Partition file systems (PFS0 and HFS0) parsed at any offset of a source,
 //! keeping the raw header so it can be rewritten for a new layout.
 
-use crate::bytes::{c_string, u32_le, u64_le};
+use crate::bytes::{c_str, quoted, u32_le, u64_le};
 use crate::error::{Result, fail};
 use crate::storage::{ReadAt, read_array};
 
@@ -97,10 +97,10 @@ impl PartitionFs {
         Self::parse(src, 0, src.size()?, PartitionKind::Pfs0)
     }
 
-    /// Parse the file system at `base` of `src`. Every file must end at or
-    /// before `limit` (an absolute offset in `src`, which may lie past its
-    /// end). The header and the padding up to the lowest file offset may not
-    /// exceed 64 MiB.
+    /// Parse the file system at `base` of `src`. The header and every file
+    /// must end at or before `limit` (an absolute offset in `src`, which may
+    /// lie past its end). The header and the padding up to the lowest file
+    /// offset may not exceed 64 MiB.
     pub fn parse<R: ReadAt + ?Sized>(
         src: &R,
         base: u64,
@@ -119,14 +119,22 @@ impl PartitionFs {
         if header_size > MAX_HEADER {
             fail!(InvalidData, "{k} header too large");
         }
+        // The header is part of what `limit` bounds. A partition of an XCI
+        // with less room than its own header could be listed any number of
+        // times at no cost in the file, and each one is read and kept.
+        let Some(data_start) = base.checked_add(header_size).filter(|&s| s <= limit) else {
+            fail!(OutOfRange, "{k} header out of range");
+        };
         let mut raw = vec![0u8; header_size as usize];
         src.read_at(base, &mut raw)?;
         let es = kind.entry_size() as usize;
         let str_base = 0x10 + count as usize * es;
-        let Some(data_start) = base.checked_add(header_size) else {
-            fail!(OutOfRange, "{k} header out of range");
-        };
         let mut entries = Vec::with_capacity(count as usize);
+        // Bytes of the names read so far. Names that do not share bytes
+        // never add up to more than the string table, so a larger total is
+        // a crafted table, which would cost up to a copy of the string
+        // table per entry.
+        let mut names = 0;
         for i in 0..count as usize {
             let e = &raw[0x10 + i * es..];
             let rel = u64_le(e, 0);
@@ -135,12 +143,17 @@ impl PartitionFs {
             if name_off >= str_size {
                 fail!(InvalidData, "{k} entry {i}: bad name offset");
             }
-            let name = c_string(&raw[str_base + name_off as usize..]);
+            let name = c_str(&raw[str_base + name_off as usize..]);
+            names += name.len() as u64;
+            if names > str_size {
+                fail!(InvalidData, "{k} entry {i}: names overlap");
+            }
+            let name = String::from_utf8_lossy(name).into_owned();
             let Some(offset) = data_start
                 .checked_add(rel)
                 .filter(|&o| o.checked_add(size).is_some_and(|end| end <= limit))
             else {
-                fail!(OutOfRange, "{k} entry {name:?} out of bounds");
+                fail!(OutOfRange, "{k} entry {} out of bounds", quoted(&name));
             };
             entries.push(Entry { name, offset, size });
         }
@@ -226,6 +239,11 @@ pub(crate) mod tests {
             assert_eq!(fs.raw.len() as u64, fs.entries[0].offset);
             // A limit before the last file end is rejected.
             assert!(PartitionFs::parse(&img, 0, img.len() as u64 - 1, kind).is_err());
+            // So is one before the end of the header, files or not.
+            let empty = build_fs(kind, &[], align);
+            assert!(PartitionFs::parse(&empty, 0, empty.len() as u64, kind).is_ok());
+            let r = PartitionFs::parse(&empty, 0, 0x10, kind);
+            assert!(matches!(r, Err(crate::Error::OutOfRange(_))));
         }
     }
 
@@ -263,6 +281,32 @@ pub(crate) mod tests {
         let mut img = build_fs(PartitionKind::Pfs0, &[("a", &[0; 4])], 1);
         img[0x10..0x18].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(PartitionFs::parse(&img, 0, u64::MAX, PartitionKind::Pfs0).is_err());
+    }
+
+    /// Entries that share one unterminated name would each get a copy of
+    /// the whole string table.
+    #[test]
+    fn shared_names_are_an_error() {
+        for kind in [PartitionKind::Pfs0, PartitionKind::Hfs0] {
+            let (count, str_size) = (64u32, 0x1000u32);
+            let mut img = kind.magic().to_vec();
+            img.extend(count.to_le_bytes());
+            img.extend(str_size.to_le_bytes());
+            img.extend([0; 4]);
+            img.resize(0x10 + count as usize * kind.entry_size() as usize, 0);
+            img.resize(img.len() + str_size as usize, b'A');
+            let r = PartitionFs::parse(&img, 0, img.len() as u64, kind);
+            assert!(matches!(r, Err(crate::Error::InvalidData(m)) if m.contains("names overlap")));
+            // One such entry is still a name that ends with the table.
+            img[4..8].copy_from_slice(&1u32.to_le_bytes());
+            let one = [
+                &img[..0x10 + kind.entry_size() as usize],
+                &[b'A'; 0x1000][..],
+            ]
+            .concat();
+            let fs = PartitionFs::parse(&one, 0, one.len() as u64, kind).unwrap();
+            assert_eq!(fs.entries[0].name.len(), 0x1000);
+        }
     }
 
     #[test]

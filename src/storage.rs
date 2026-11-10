@@ -23,7 +23,7 @@ pub trait ReadAt {
     fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         // Check before allocating: lengths come from file data.
         check_range(offset, len, self.size()?)?;
-        let mut v = vec![0u8; len];
+        let mut v = zeroed(len as u64)?;
         self.read_at(offset, &mut v)?;
         Ok(v)
     }
@@ -48,6 +48,18 @@ pub trait ReadAt {
         }
         Ok(())
     }
+}
+
+/// `len` zero bytes. Lengths come from file data, and a storage need not
+/// have its size in real bytes behind it (a compressed section), so an
+/// allocation that fails is an error instead of an abort.
+pub(crate) fn zeroed(len: u64) -> Result<Vec<u8>> {
+    let mut v = Vec::new();
+    match usize::try_from(len) {
+        Ok(n) if v.try_reserve_exact(n).is_ok() => v.resize(n, 0),
+        _ => fail!(InvalidData, "cannot allocate {len} bytes"),
+    }
+    Ok(v)
 }
 
 /// Fail unless the `len` bytes at `offset` lie within `size` bytes. The end
@@ -238,5 +250,27 @@ mod tests {
         assert!(sub.read_at(u64::MAX - 7, &mut buf).is_err());
         assert!(SubStorage::new(&data, u64::MAX, 8).is_err());
         assert!(SubStorage::new(&data, 30, 4).is_err());
+    }
+
+    /// A storage that claims any size, like a compressed section whose
+    /// table says so.
+    struct Endless;
+
+    impl ReadAt for Endless {
+        fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<()> {
+            buf.fill(0);
+            Ok(())
+        }
+        fn size(&self) -> Result<u64> {
+            Ok(u64::MAX)
+        }
+    }
+
+    #[test]
+    fn huge_read_is_an_error() {
+        assert_eq!(Endless.read_vec(1 << 40, 4).unwrap(), [0; 4]);
+        let r = Endless.read_vec(0, usize::MAX);
+        assert!(matches!(r, Err(Error::InvalidData(_))));
+        assert!(zeroed(u64::MAX).is_err());
     }
 }
